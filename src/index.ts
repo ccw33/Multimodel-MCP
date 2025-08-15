@@ -33,6 +33,20 @@ interface VisionResult {
   };
 }
 
+interface FileProcessingResult {
+  ok: boolean;
+  fileId?: string;
+  content?: string;
+  fileType?: string;
+  filename?: string;
+  error?: string;
+  metadata?: {
+    uploadTime: number;
+    fileSize: number;
+    processingTime: number;
+  };
+}
+
 // 注册图片读取工具
 mcpServer.registerTool("read_image", {
   description: "读取本地/URL图片并返回 dataURL 与尺寸信息",
@@ -75,6 +89,36 @@ mcpServer.registerTool("vision_query", {
 }, async ({ path: imagePath, prompt, mode, returnJson }) => {
   try {
     const result = await visionQuery(imagePath, prompt, mode, returnJson);
+    return {
+      content: [{
+        type: "text" as const,
+        text: JSON.stringify(result, null, 2)
+      }]
+    };
+  } catch (error) {
+    return {
+      content: [{
+        type: "text" as const,
+        text: JSON.stringify({
+          ok: false,
+          error: error instanceof Error ? error.message : "Unknown error"
+        }, null, 2)
+      }],
+      isError: true
+    };
+  }
+});
+
+// 注册文件处理工具
+mcpServer.registerTool("process_file", {
+  description: "使用 GLM-4.5V 处理文件（上传并提取内容）。支持 PDF、DOCX、DOC、XLS、XLSX、PPT、PPTX、PNG、JPG、JPEG、CSV 等格式",
+  inputSchema: {
+    filePath: z.string().describe("文件路径（本地文件路径）"),
+    extractPrompt: z.string().optional().describe("可选的内容提取提示词，用于指导如何提取文件内容"),
+  },
+}, async ({ filePath, extractPrompt }) => {
+  try {
+    const result = await processFile(filePath, extractPrompt);
     return {
       content: [{
         type: "text" as const,
@@ -259,6 +303,64 @@ async function visionQuery(imagePath: string, prompt: string, mode: string, retu
   }
 }
 
+// 文件处理主函数
+async function processFile(filePath: string, extractPrompt?: string): Promise<FileProcessingResult> {
+  const startTime = Date.now();
+
+  try {
+    console.error(`[DEBUG] processFile called with path: ${filePath}`);
+
+    // 检查文件是否存在
+    const resolvedPath = path.resolve(filePath);
+    const stats = await fs.stat(resolvedPath);
+    const fileSize = stats.size;
+    const filename = path.basename(filePath);
+
+    console.error(`[DEBUG] File size: ${fileSize} bytes, filename: ${filename}`);
+
+    // 检查文件大小限制
+    const maxSize = isImageFile(filename) ? 5 * 1024 * 1024 : 50 * 1024 * 1024; // 图片5MB，其他50MB
+    if (fileSize > maxSize) {
+      throw new Error(`文件大小超过限制。图片文件最大5MB，其他文件最大50MB。当前文件大小：${(fileSize / 1024 / 1024).toFixed(2)}MB`);
+    }
+
+    // 检查文件格式
+    if (!isSupportedFileType(filename)) {
+      throw new Error(`不支持的文件格式。支持的格式：PDF、DOCX、DOC、XLS、XLSX、PPT、PPTX、PNG、JPG、JPEG、CSV`);
+    }
+
+    // 1. 上传文件
+    console.error(`[DEBUG] Uploading file...`);
+    const fileId = await uploadFileToGLM(resolvedPath, filename);
+    console.error(`[DEBUG] File uploaded with ID: ${fileId}`);
+
+    // 2. 获取文件内容
+    console.error(`[DEBUG] Getting file content...`);
+    const content = await getFileContentFromGLM(fileId);
+    console.error(`[DEBUG] Content extracted, length: ${content.length}`);
+
+    const processingTime = Date.now() - startTime;
+
+    return {
+      ok: true,
+      fileId,
+      content,
+      fileType: getFileType(filename),
+      filename,
+      metadata: {
+        uploadTime: startTime,
+        fileSize,
+        processingTime
+      }
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      error: error instanceof Error ? error.message : "Unknown error"
+    };
+  }
+}
+
 function guessExt(imagePath: string): string {
   const ext = imagePath.split(".").pop()?.toLowerCase() || "png";
   return ext === "jpg" ? "jpeg" : ext;
@@ -345,6 +447,115 @@ function normalizeGlmResult(data: any, opts: { mode: string; returnJson: boolean
   return content;
 }
 
+// 文件处理辅助函数
+function isImageFile(filename: string): boolean {
+  const imageExtensions = ['.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp'];
+  const ext = path.extname(filename).toLowerCase();
+  return imageExtensions.includes(ext);
+}
+
+function isSupportedFileType(filename: string): boolean {
+  const supportedExtensions = [
+    '.pdf', '.docx', '.doc', '.xls', '.xlsx', '.ppt', '.pptx',
+    '.png', '.jpg', '.jpeg', '.csv', '.txt'
+  ];
+  const ext = path.extname(filename).toLowerCase();
+  return supportedExtensions.includes(ext);
+}
+
+function getFileType(filename: string): string {
+  const ext = path.extname(filename).toLowerCase();
+  const typeMap: { [key: string]: string } = {
+    '.pdf': 'PDF文档',
+    '.docx': 'Word文档',
+    '.doc': 'Word文档',
+    '.xls': 'Excel表格',
+    '.xlsx': 'Excel表格',
+    '.ppt': 'PowerPoint演示文稿',
+    '.pptx': 'PowerPoint演示文稿',
+    '.png': 'PNG图片',
+    '.jpg': 'JPEG图片',
+    '.jpeg': 'JPEG图片',
+    '.csv': 'CSV数据文件',
+    '.txt': '文本文件'
+  };
+  return typeMap[ext] || '未知文件类型';
+}
+
+async function uploadFileToGLM(filePath: string, filename: string): Promise<string> {
+  const glmApiKey = process.env.GLM_API_KEY;
+  if (!glmApiKey) {
+    throw new Error("GLM_API_KEY environment variable is required");
+  }
+
+  try {
+    // 读取文件
+    const fileBuffer = await fs.readFile(filePath);
+
+    // 创建 FormData
+    const formData = new FormData();
+    const blob = new Blob([new Uint8Array(fileBuffer)]);
+    formData.append('file', blob, filename);
+    formData.append('purpose', 'file-extract');
+
+    const response = await fetch('https://open.bigmodel.cn/api/paas/v4/files', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${glmApiKey}`
+      },
+      body: formData
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`文件上传失败: ${response.status} ${response.statusText} - ${errorText}`);
+    }
+
+    const result = await response.json();
+    if (!result.id) {
+      throw new Error('上传响应中缺少文件ID');
+    }
+
+    return result.id;
+  } catch (error) {
+    throw new Error(`文件上传失败: ${error instanceof Error ? error.message : 'Unknown error'}`);
+  }
+}
+
+async function getFileContentFromGLM(fileId: string): Promise<string> {
+  const glmApiKey = process.env.GLM_API_KEY;
+  if (!glmApiKey) {
+    throw new Error("GLM_API_KEY environment variable is required");
+  }
+
+  try {
+    const response = await fetch(`https://open.bigmodel.cn/api/paas/v4/files/${fileId}/content`, {
+      method: 'GET',
+      headers: {
+        'Authorization': `Bearer ${glmApiKey}`
+      }
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`获取文件内容失败: ${response.status} ${response.statusText} - ${errorText}`);
+    }
+
+    // 根据响应类型处理内容
+    const contentType = response.headers.get('content-type') || '';
+
+    if (contentType.includes('application/json')) {
+      const jsonResult = await response.json();
+      return JSON.stringify(jsonResult, null, 2);
+    } else {
+      // 对于其他类型，尝试作为文本读取
+      return await response.text();
+    }
+  } catch (error) {
+    throw new Error(`获取文件内容失败: ${error instanceof Error ? error.message : 'Unknown error'}`);
+  }
+}
+
 async function main() {
   // 显示 MCP 服务器配置信息
   console.error("=".repeat(60));
@@ -356,6 +567,7 @@ async function main() {
   console.error(`🔧 Available Tools:`);
   console.error(`   • read_image - 读取本地/URL图片并返回 dataURL 与尺寸信息`);
   console.error(`   • vision_query - 调用 GLM-4.5V 对图片进行 OCR/问答/检测`);
+  console.error(`   • process_file - 使用 GLM-4.5V 处理文件（上传并提取内容）`);
   console.error(`🌐 GLM API Endpoint: ${process.env.GLM_BASE_URL || "https://open.bigmodel.cn/api/paas/v4/chat/completions"}`);
   console.error(`🔑 API Key Status: ${process.env.GLM_API_KEY ? "✅ Configured" : "❌ Missing"}`);
   
