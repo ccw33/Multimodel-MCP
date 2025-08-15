@@ -1,0 +1,6 @@
+{
+  "enabledMcpjsonServers": [
+    "glm-v"
+  ],
+  "enableAllProjectMcpServers": true
+}
